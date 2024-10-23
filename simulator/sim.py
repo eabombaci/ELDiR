@@ -16,7 +16,6 @@ spring_omega = 10
 damping = 15
 friction = 1.0
 n_ground_segs = 0
-ground_samples_file = 'ground_sample_points.npy'
 
 ## Robot population parameters
 max_springs = 0
@@ -35,10 +34,11 @@ def set_ti_globals():
     scalarf64 = lambda: ti.field(dtype=ti.f64)
     scalari32 = lambda: ti.field(dtype=ti.i32)
     vecf64 = lambda: ti.Vector.field(2, dtype=ti.f64)
+    arr64 = lambda: ti.field(dtype=ti.f64, shape=(10,))
     global x, v, v_inc, center, loss, update_scale, n_objects, n_springs, \
         spring_anchor_a, spring_anchor_b, spring_length, spring_stiffness, spring_actuation, \
             weights1, bias1, weights2, bias2, hidden, act, \
-                ground_segs_x0, ground_segs_y0, ground_segs_slope, ground_segs_shift, ground_segs_len
+                x_samples, y_samples, ground_segs_x0, ground_segs_y0, ground_segs_slope, ground_segs_shift, ground_segs_len
     loss = scalarf64()
     x = vecf64()
     v = vecf64()
@@ -58,8 +58,8 @@ def set_ti_globals():
     center = vecf64()
     act = scalarf64()
     update_scale = scalarf64()
-    x_samples = scalarf64()
-    y_samples = scalarf64()
+    x_samples = arr64()
+    y_samples = arr64()
     ground_segs_x0 = scalarf64()
     ground_segs_y0 = scalarf64()
     ground_segs_slope = scalarf64()
@@ -167,15 +167,18 @@ def ground_height_at_(x_val, xs, ys):
     return ground_height
 
 @ti.func
-def ground_height_at(x_val: ti.f64, xs, ys):
-    ground_height = np.interp(x_val, xs, ys)
-
-    ground_height_ti = ti.field(dtype=ti.f64, shape=())
+def ground_height_at(x_val: ti.f64):
+    ground_height = 0.0
     
-    ground_height_ti[None] = ground_height
+    for i in range(x_samples.shape[0] - 1):
+        if x_val > x_samples[i] and x_val < x_samples[i+1]:
+            x0 = i
+            x1 = i + 1
+    
+    ground_height = y_samples[x0] + (y_samples[x1] - y_samples[x0])/(x_samples[x1] - x_samples[x0]) * (x_val - x_samples[x0])
 
     return ground_height
-
+    
 """
 def ground_seg_at_(x_val):
     seg = -1
@@ -207,23 +210,33 @@ def distance_to_ground_at(x_val: ti.f64, y_val: ti.f64, xs, ys):
     return distance
 
 @ti.func
-def normal_vec(xs, ys, x_val: ti.f64()):
-    slope = (ground_height_at(x_val + 1e-6, xs, ys) - ground_height_at(x_val - 1e-6, xs, ys)) / (2 * 1e-6)
+def normal_vec(x_val: ti.f64()):
+    slope = (ground_height_at(x_val + 1e-6) - ground_height_at(x_val - 1e-6)) / (2 * 1e-6)
     return ti.Vector([-slope / ti.sqrt(1 + slope**2), 1 / ti.sqrt(1 + slope**2)])
 
 #Multiply dt by v and add to position to get position at dt. If below ground, multiply dt by a fraction through a for loop and that is your toi
 @ti.func
-def compute_toi(xs, ys, x_val: ti.f64, y_val: ti.f64, vx: ti.f64, vy: ti.f64):
+def compute_toi(x_val: ti.f64, y_val: ti.f64, vx: ti.f64, vy: ti.f64, adjustment = 0.9):
+    x_pos = x_val + (vx * dt)
+    y_pos = y_val + (vy * dt)
+
+    if y_pos < ground_height_at(x_pos):
+        new_step = dt * (adjustment**10)
+
+    return new_step
+
+    """
     dist = distance_to_ground_at(x_val, y_val)
     norm_vec = normal_vec(xs, ys, x_val)
     v = ti.Vector([vx, vy])
     norm_vec_mag = ti.abs(v.dot(norm_vec))
     toi = dist / (norm_vec_mag + 1e-10)
     return toi
+    """
 
 @ti.func
-def new_v_on_contact(xs, ys, x_val: ti.f64(), vx: ti.f64, vy: ti.f64):
-    norm_vec = normal_vec(xs, ys, x_val)
+def new_v_on_contact(x_val: ti.f64(), vx: ti.f64, vy: ti.f64):
+    norm_vec = normal_vec(x_val)
     v = ti.Vector([vx, vy])
     norm_vec_scale = v.dot(norm_vec)
     norm_vec = norm_vec * norm_vec_scale
@@ -236,7 +249,7 @@ def new_v_on_contact(xs, ys, x_val: ti.f64(), vx: ti.f64, vy: ti.f64):
     return new_v
 
 @ti.kernel
-def advance(tm: ti.i32, xs, ys):
+def advance(tm: ti.i32):
     for r, i in ti.ndrange(n_robots, max_objects):
         if i < n_objects[r]:
             s = ti.exp(-dt * damping)
@@ -244,18 +257,18 @@ def advance(tm: ti.i32, xs, ys):
             old_x = x[r, tm - 1, i]
             new_x = old_x + dt * v_
 
-            ground_height = ground_height_at(new_x[0], xs, ys)
+            ground_height = ground_height_at(new_x[0])
 
             if new_x[1] < ground_height:
-                toi = compute_toi(xs, ys, old_x[0], old_x[1], v_[0], v_[1])
+                toi = compute_toi(old_x[0], old_x[1], v_[0], v_[1])
                 toi = ti.min(ti.max(0, toi), dt)
                 new_x = old_x + toi * v_
-                v_ = new_v_on_contact(xs, ys, new_x[0], v_[0], v_[1])
-                ground_height = ground_height_at(new_x[0], xs, ys)
+                v_ = new_v_on_contact(new_x[0], v_[0], v_[1])
+                ground_height = ground_height_at(new_x[0])
                 
                 if toi < dt:
                     new_x += (dt - toi) * v_
-                    ground_height = ground_height_at(new_x[0], xs, ys)
+                    ground_height = ground_height_at(new_x[0])
 
                 if new_x[1] < ground_height:
                     new_x[1] = ground_height
@@ -348,8 +361,8 @@ def setup_robot(id: ti.i32, n_obj: ti.i32, objects: ti.types.ndarray(), n_spr: t
         spring_actuation[id, i] = springs[i, 4]
 
 ## Load all robots into taichi 
-def setup(robots_file, idx0=None, idx1=None):
-    global n_robots, max_objects, max_springs, ground_samples_file, n_ground_segs
+def setup(robots_file, ground_samples_file, idx0=None, idx1=None):
+    global n_robots, max_objects, max_springs, n_ground_segs
 
     with open(robots_file, "rb") as f:
         robots = pickle.load(f)
@@ -370,8 +383,8 @@ def setup(robots_file, idx0=None, idx1=None):
     print(f"num robots: {n_robots}, max num points: {max_objects}, max num springs: {max_springs}", flush=True)
 
     if ground_samples_file is None:
-        x_samples = np.linspace(0, 1.25, 10)
-        y_samples = [None] * 10
+        for i in range(10):
+            x_samples[i] = i * (1.25 / 9)
         for i in range(10):
             y_samples[i] = 0
         print(f"Using flat terrain...", flush=True)
@@ -585,7 +598,7 @@ def optimize(outdir, idx0=None, idx1=None):
     np.save(loss_save_path, loss_hist)
 
 ## End to end simulation: load robots, optimize locomotion, etc. 
-def simulate(robots_file, outdir, device_id, logfile=None, idx0=None, idx1=None, seed=0, debug=False):
+def simulate(robots_file, outdir, device_id, ground_samples_file, logfile=None, idx0=None, idx1=None, seed=0, debug=False):
     ## Std out and std err to log file
     if logfile is not None:
         if os.path.exists(logfile):
@@ -613,7 +626,7 @@ def simulate(robots_file, outdir, device_id, logfile=None, idx0=None, idx1=None,
     print(f"Random seed: {seed}", flush=True)
 
     ## Load initial robot states into Taichi
-    setup(robots_file, idx0, idx1)
+    setup(robots_file, ground_samples_file, idx0, idx1)
 
     ## Run optimization
     optimize(outdir, idx0, idx1)
